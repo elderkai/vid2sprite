@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<!--
+  vid2sprite.html — 绿幕视频/图片 → 游戏精灵帧 · 浏览器单文件工具
+  ==================================================================
+  用法：双击直接打开（file:// 可运行），无网络请求、不上传任何数据。
+
+  两种模式（顶部页签切换）：
+    【抠视频】选择/拖入绿幕视频 → 抽帧(seek+drawImage) → 去重(变化像素占比)
+              → 逐帧抠幕 → 质检表 → 条带/ZIP 下载
+    【抠图】  选择文件夹或拖入多张图片 → 可选绿幕抠像 → 多主体切块
+              （表情差分表按行聚类成阅读顺序）→ 合成条带 / ZIP
+
+  代码结构：
+    1. style 区        深色 UI 主题（CSS 变量集中在 :root）
+    2. body 区         左面板（页签/参数/日志）+ 右面板（预览画布/质检表）
+    3. script 核心区   /*CORE-BEGIN..END*/ 标记的纯算法区，与 vid2sprite.py
+       同步实现，不碰 DOM，可用 Node 抽出做单元测试
+    4. script 应用层   入口路由(视频/图片自动分流)、两条主流程、
+       条带/ZIP 导出、极简 store-only ZIP 打包器
+
+  关键算法（详见各函数头注释）：
+    - chromaAlpha    相对绿超出度色键 + 黑发门控（或关系，勿改乘积）
+    - unpremultiply  去溢色（消除边缘绿边）
+    - keepComponents / splitSprites / autoMinArea  多主体切块
+    - fillHoles      边界 flood-fill 补内部洞
+
+  License: MIT
+-->
+<head>
+<meta charset="UTF-8">
+<title>绿幕视频/图片 → 精灵帧 · 本地处理工具</title>
+<style>
+  :root{
+    --bg:#14171c; --panel:#1d2229; --panel2:#232a33; --line:#2f3945;
+    --fg:#d8dee6; --dim:#8a96a5; --acc:#4fc38a; --warn:#e0b04f; --bad:#e06c5f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI",system-ui,sans-serif;padding:18px}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:14px}
+  .layout{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .left{width:340px;flex-shrink:0}
+  .right{flex:1;min-width:520px}
+  .drop{border:2px dashed var(--line);border-radius:8px;padding:22px;text-align:center;color:var(--dim);cursor:pointer;transition:.15s}
+  .drop.on{border-color:var(--acc);color:var(--acc)}
+  .row{display:flex;justify-content:space-between;align-items:center;margin:7px 0;gap:8px}
+  .row label{color:var(--dim);font-size:12px;flex:1}
+  .row input[type=number]{width:70px;background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:4px;padding:3px 6px}
+  .row input[type=checkbox]{accent-color:var(--acc)}
+  select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:4px;padding:3px}
+  button{background:var(--acc);color:#10241a;border:0;border-radius:5px;padding:7px 14px;font-weight:600;cursor:pointer;font-size:13px}
+  button:disabled{background:#3a4550;color:#77828e;cursor:not-allowed}
+  button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
+  .sec{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+  .sec h3{margin:0 0 6px;font-size:13px;color:var(--acc)}
+  #log{font:11px/1.7 Consolas,monospace;color:var(--dim);max-height:190px;overflow:auto;white-space:pre-wrap;background:#12151a;border:1px solid var(--line);border-radius:6px;padding:8px}
+  .ok{color:var(--acc)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  #stats{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+  #stats td{padding:2px 8px;border-bottom:1px solid var(--line)}
+  #stats td:first-child{color:var(--dim)}
+  #preview{width:100%;border:1px solid var(--line);border-radius:6px;background:#0d0f13;display:block}
+  .tips{font-size:11px;color:var(--dim);margin-top:8px}
+  .tips b{color:var(--warn)}
+  .tabs{display:flex;gap:6px;margin-bottom:12px}
+  .tabs button{flex:1;background:var(--panel2);color:var(--dim);border:1px solid var(--line);padding:9px 0;font-size:14px}
+  .tabs button.on{background:var(--acc);color:#10241a;border-color:var(--acc)}
+  video{display:none}
+</style>
+</head>
+<body>
+<h1>绿幕视频/图片 → 精灵帧 · 本地处理工具</h1>
+<div class="sub">抽帧 → 去重 → 抠幕（黑发门控 / 补洞 / 去溢色 / 多主体切块）→ 质检 → 条带 + ZIP。全部本地运行，不上传任何数据。</div>
+
+<div class="layout">
+  <div class="panel left">
+    <div class="tabs">
+      <button id="tabVid" class="on">抠视频</button>
+      <button id="tabImg">抠图</button>
+    </div>
+    <div class="drop" id="drop">点击或拖入视频<br><span style="font-size:11px">mp4 / webm（HEVC 需浏览器支持该编码）</span></div>
+    <input type="file" id="file" accept="video/*" style="display:none">
+    <div class="sec" id="secVideo">
+      <h3>视频参数</h3>
+      <div class="row"><label>抽帧帧率 fps</label><input type="number" id="fps" value="12" min="1" max="30"></div>
+      <div class="row"><label>最多帧数</label><input type="number" id="maxFrames" value="120" min="1" max="600"></div>
+      <div class="row"><label>丢弃重复帧（按变化像素占比）</label><input type="checkbox" id="dedupe" checked></div>
+      <button id="go" disabled>开始自动处理</button>
+    </div>
+    <div class="sec" id="secImage" style="display:none">
+      <h3>图片参数</h3>
+      <div class="drop" id="dropDir" style="padding:12px;font-size:12px">选择文件夹（或把图片直接拖到上方）</div>
+      <input type="file" id="dirIn" webkitdirectory style="display:none">
+      <div class="row"><label>对图片做绿幕抠像（透明 PNG 就关）</label><input type="checkbox" id="dirKey"></div>
+      <div class="row"><label>多主体图（表情差分表，保留全部并切块）</label><input type="checkbox" id="multiSub"></div>
+      <div class="row" id="minAreaRow" style="display:none"><label>最小保留面积 px（0=自动）</label><input type="number" id="minArea" value="0" min="0"></div>
+      <button id="goDir" class="ghost" disabled>合成条带</button>
+      <div class="tips">文件按名称数字序排列（1 → 2 → 10）；多主体 ZIP 按阅读顺序命名 1.png 起</div>
+    </div>
+    <div class="sec">
+      <h3>抠像与输出</h3>
+      <div class="row"><label>键控下阈 lo</label><input type="number" id="lo" value="0.12" step="0.01"></div>
+      <div class="row"><label>键控上阈 hi</label><input type="number" id="hi" value="0.35" step="0.01"></div>
+      <div class="row"><label>黑发门控（暗调幕布必开）</label><input type="checkbox" id="absGate" checked></div>
+      <div class="row"><label>补内部洞 fill-holes</label><input type="checkbox" id="fillHoles" checked></div>
+      <div class="row"><label>输出尺寸（条带与 ZIP 统一）</label>
+        <select id="outMode">
+          <option value="bbox" selected>统一裁到内容包围盒</option>
+          <option value="full">原始帧尺寸</option>
+          <option value="custom">自定义格尺寸（缩放居中）</option>
+        </select></div>
+      <div class="row" id="cellRow" style="display:none"><label>格宽 × 格高</label>
+        <input type="number" id="cellW" value="256" min="8" style="width:60px"> ×
+        <input type="number" id="cellH" value="256" min="8" style="width:60px"></div>
+    </div>
+    <div class="sec">
+      <button id="dlStrip" class="ghost" disabled>下载条带 PNG</button>
+      <button id="dlZip" class="ghost" disabled>下载全部抠像 PNG (zip)</button>
+    </div>
+    <div class="sec"><h3>日志</h3><div id="log">等待文件…</div></div>
+  </div>
+
+  <div class="panel right">
+    <h3 style="margin:0 0 8px;font-size:13px;color:var(--acc)">预览（上：原帧 / 下：抠像合成到深色棋盘）</h3>
+    <canvas id="preview" width="960" height="400"></canvas>
+    <table id="stats"></table>
+    <div class="tips">
+      <b>提示</b>：① 主体是绿色系时绿幕会连主体一起抠掉，这类素材请用蓝幕/品红幕再拍；② 抠完必须目检预览——指标抓不住"辉光变锯齿实心块"这类只有眼睛能发现的问题；③ 表情差分表这类"一张图里很多主体"的素材，务必勾选「多主体图」，否则只保留最大的一块；④ 若视频加载黑屏，多半是浏览器没有 HEVC 解码器，换 H.264 或用 Edge（装 HEVC 扩展）。
+    </div>
+  </div>
+</div>
+<video id="vid" crossorigin="anonymous"></video>
+
+<script>
+/*CORE-BEGIN*/
+// ==== 纯算法区（与 tools/vid2sprite.py 同步，可在 Node 中单测） ====
+function smoothstep(lo, hi, x){
+  if (hi <= lo) return x >= hi ? 1 : 0;
+  var t = Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
+  return t * t * (3 - 2 * t);
+}
+function median(arr){
+  if(!arr.length) return 0;
+  var s = Array.from(arr).sort(function(a,b){return a-b;});
+  return s[s.length>>1];
+}
+// 幕布色：从画面外圈 2% 边框环取中位数，不硬编码纯绿
+function estimateScreen(data, w, h){
+  var rs=[], gs=[], bs=[];
+  var mx = Math.max(2, Math.floor(w*0.02)), my = Math.max(2, Math.floor(h*0.02));
+  for(var y=0;y<h;y++){
+    var edgeRow = (y<my || y>=h-my);
+    for(var x=0;x<w;x++){
+      if(!edgeRow && x>=mx && x<w-mx) continue;
+      var j=(y*w+x)*4;
+      rs.push(data[j]); gs.push(data[j+1]); bs.push(data[j+2]);
+    }
+  }
+  return [median(rs), median(gs), median(bs)];
+}
+// 键控 alpha。相对绿超出度被幕布自身超出度归一。
+// 黑发门控是 max（或）关系：「绝对绿超出够高」或「亮度够高」→ 正常判背景；
+// 两者都低的暗发丝救回。绝不能写成乘积（AND）——亮烟会被误保留（两侧都踩过）。
+function chromaAlpha(data, w, h, screen, P){
+  var n=w*h, a=new Float32Array(n);
+  var sG=screen[1], mxs=Math.max(screen[0], screen[2]);
+  var kexc=(sG-mxs)/Math.max(sG,1);
+  var gLo=0.65*sG, gHi=0.85*sG;
+  for(var i=0;i<n;i++){
+    var j=i*4, R=data[j], G=data[j+1], B=data[j+2];
+    var mx=Math.max(R,B);
+    var absExc=G-mx;
+    var exc=absExc/Math.max(G,1);
+    if(kexc>1e-6) exc/=kexc;
+    if(P.absLo>0){
+      var bright=smoothstep(gLo,gHi,G);
+      var absOK=smoothstep(P.absLo,P.absHi,absExc);
+      exc*=Math.max(bright,absOK);
+    }
+    a[i]=1-smoothstep(P.lo,P.hi,exc);
+  }
+  return a;
+}
+// 去溢色 un-premultiply：C_fg=(C_obs-(1-a)*C_screen)/a
+function unpremultiply(data, w, h, screen, a){
+  var out=new Uint8ClampedArray(w*h*4);
+  var sR=screen[0], sG=screen[1], sB=screen[2];
+  for(var i=0;i<w*h;i++){
+    var al=a[i], j=i*4;
+    if(al<=0.02){ out[j]=data[j]; out[j+1]=data[j+1]; out[j+2]=data[j+2]; }
+    else{
+      var inv=1/al;
+      out[j]  =(data[j]  -(1-al)*sR)*inv;
+      out[j+1]=(data[j+1]-(1-al)*sG)*inv;
+      out[j+2]=(data[j+2]-(1-al)*sB)*inv;
+    }
+    out[j+3]=Math.round(al*255);
+  }
+  return out;
+}
+function toBin(a){
+  var n=a.length, b=new Uint8Array(n);
+  for(var i=0;i<n;i++) b[i]=a[i]>0.5?1:0;
+  return b;
+}
+// alpha 腐蚀 n 像素（3x3 最小值），吃残留绿边
+function erodeAlpha(a, w, h, iters){
+  for(var it=0; it<iters; it++){
+    var src=a.slice();
+    for(var y=0;y<h;y++)for(var x=0;x<w;x++){
+      var m=1;
+      for(var dy=-1;dy<=1;dy++){ var yy=y+dy; if(yy<0||yy>=h) continue;
+        for(var dx=-1;dx<=1;dx++){ var xx=x+dx; if(xx<0||xx>=w) continue;
+          var v=src[yy*w+xx]; if(v<m) m=v; } }
+      a[y*w+x]=m;
+    }
+  }
+}
+// 单主体：只保留最大连通块（扔水印/碎屑/残影）
+function largestComponent(a, w, h){
+  var n=w*h, bin=toBin(a);
+  var label=new Int32Array(n), stack=new Int32Array(n);
+  var best=0, bestId=0, id=0;
+  for(var s=0;s<n;s++){
+    if(!bin[s]||label[s]) continue;
+    id++; var cnt=0, sp=0; stack[sp++]=s; label[s]=id;
+    while(sp){
+      var p=stack[--sp]; cnt++;
+      var x=p%w, y=(p/w)|0;
+      if(x>0   && bin[p-1] && !label[p-1]){ label[p-1]=id; stack[sp++]=p-1; }
+      if(x<w-1 && bin[p+1] && !label[p+1]){ label[p+1]=id; stack[sp++]=p+1; }
+      if(y>0   && bin[p-w] && !label[p-w]){ label[p-w]=id; stack[sp++]=p-w; }
+      if(y<h-1 && bin[p+w] && !label[p+w]){ label[p+w]=id; stack[sp++]=p+w; }
+    }
+    if(cnt>best){ best=cnt; bestId=id; }
+  }
+  for(var i=0;i<n;i++) if(bin[i] && label[i]!==bestId) a[i]=0;
+  return best;
+}
+// 多主体：保留所有面积 >= minArea 的连通块。
+// why: largestComponent 假设"每帧只有一个主体"，对 4x10 表情差分表会把
+// 40 个头只留 1 个、其余 39 个当碎屑删掉（真实素材踩过）。
+// minArea 只滤小噪点；水印这类大块碎屑请裁掉原图再用。
+// 所有连通块面积（不修改 a）。autoMinArea 与"静默丢主体"检测共用。
+function componentAreas(a, w, h){
+  var n=w*h, bin=toBin(a);
+  var label=new Int32Array(n), stack=new Int32Array(n), areas=[];
+  var id=0;
+  for(var s=0;s<n;s++){
+    if(!bin[s]||label[s]) continue;
+    id++; var cnt=0, sp=0; stack[sp++]=s; label[s]=id;
+    while(sp){
+      var p=stack[--sp]; cnt++;
+      var x=p%w, y=(p/w)|0;
+      if(x>0   && bin[p-1] && !label[p-1]){ label[p-1]=id; stack[sp++]=p-1; }
+      if(x<w-1 && bin[p+1] && !label[p+1]){ label[p+1]=id; stack[sp++]=p+1; }
+      if(y>0   && bin[p-w] && !label[p-w]){ label[p-w]=id; stack[sp++]=p-w; }
+      if(y<h-1 && bin[p+w] && !label[p+w]){ label[p+w]=id; stack[sp++]=p+w; }
+    }
+    areas.push(cnt);
+  }
+  return areas;
+}
+// 自动碎屑阈值：最大块面积的 5%。
+// why: 固定 64px 对 4K 级差分表完全失效（实测 2720x1520 图混入 37 块发丝）；
+// 主体之间面积差通常在一个数量级以上，相对阈值尺度无关。
+function autoMinArea(a, w, h){
+  var ar=componentAreas(a,w,h), mx=0;
+  for(var i=0;i<ar.length;i++) if(ar[i]>mx) mx=ar[i];
+  return Math.max(64, Math.round(mx*0.05));
+}
+function keepComponents(a, w, h, minArea){
+  var areas=componentAreas(a,w,h);
+  // 原 label 索引已随重构消失，这里按"面积<minArea 的块清零"需要 label 映射——
+  // 重新标一遍并按 label 过滤（O(n)，与原实现等价）
+  var n=w*h, bin=toBin(a);
+  var label=new Int32Array(n), stack=new Int32Array(n);
+  var id=0;
+  for(var s=0;s<n;s++){
+    if(!bin[s]||label[s]) continue;
+    id++; var sp=0; stack[sp++]=s; label[s]=id;
+    while(sp){
+      var p=stack[--sp], x=p%w, y=(p/w)|0;
+      if(x>0   && bin[p-1] && !label[p-1]){ label[p-1]=id; stack[sp++]=p-1; }
+      if(x<w-1 && bin[p+1] && !label[p+1]){ label[p+1]=id; stack[sp++]=p+1; }
+      if(y>0   && bin[p-w] && !label[p-w]){ label[p-w]=id; stack[sp++]=p-w; }
+      if(y<h-1 && bin[p+w] && !label[p+w]){ label[p+w]=id; stack[sp++]=p+w; }
+    }
+  }
+  for(var i=0;i<n;i++) if(bin[i] && areas[label[i]-1]<minArea) a[i]=0;
+  return areas.length;
+}
+// 多主体切块：返回每个主体 bbox，按行优先排序（y 聚类成行，行内按 x）
+// = 表情表的阅读顺序，ZIP 命名 1..N 直接对应。
+function splitSprites(a, w, h, minArea){
+  var n=w*h, bin=toBin(a);
+  var label=new Int32Array(n), stack=new Int32Array(n), comps=[];
+  var id=0;
+  for(var s=0;s<n;s++){
+    if(!bin[s]||label[s]) continue;
+    id++; var cnt=0, sp=0; stack[sp++]=s; label[s]=id;
+    var x0=1e9, y0=1e9, x1=-1, y1=-1;
+    while(sp){
+      var p=stack[--sp]; cnt++;
+      var x=p%w, y=(p/w)|0;
+      if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y;
+      if(x>0   && bin[p-1] && !label[p-1]){ label[p-1]=id; stack[sp++]=p-1; }
+      if(x<w-1 && bin[p+1] && !label[p+1]){ label[p+1]=id; stack[sp++]=p+1; }
+      if(y>0   && bin[p-w] && !label[p-w]){ label[p-w]=id; stack[sp++]=p-w; }
+      if(y<h-1 && bin[p+w] && !label[p+w]){ label[p+w]=id; stack[sp++]=p+w; }
+    }
+    if(cnt>=minArea) comps.push({ x0:x0, y0:y0, x1:x1, y1:y1, area:cnt });
+  }
+  // 行聚类：按 y 中心排序，与当前行带间距 < 0.5 行高归一行；行内按 x
+  comps.sort(function(p,q){ return (p.y0+p.y1)-(q.y0+q.y1) || p.x0-q.x0; });
+  var rows=[], cur=null;
+  comps.forEach(function(c){
+    var cy=(c.y0+c.y1)/2, ch=c.y1-c.y0+1;
+    if(!cur || cy > cur.yMax + Math.max(cur.h, ch)*0.5){
+      cur={ items:[c], yMax:cy, h:ch }; rows.push(cur);
+    } else { cur.items.push(c); cur.yMax=Math.max(cur.yMax, cy); cur.h=Math.max(cur.h, ch); }
+  });
+  var out=[];
+  rows.forEach(function(r){
+    r.items.sort(function(p,q){ return p.x0-q.x0; });
+    r.items.forEach(function(c){ out.push(c); });
+  });
+  return { rows:rows.length, sprites:out };
+}
+// 边界 flood 填充：被前景包围的透明区=洞 → 填成不透明
+function fillHoles(a, w, h){
+  var n=w*h, bin=toBin(a);
+  var outside=new Uint8Array(n), stack=new Int32Array(n), sp=0;
+  function push(p){ if(!bin[p] && !outside[p]){ outside[p]=1; stack[sp++]=p; } }
+  for(var x=0;x<w;x++){ push(x); push((h-1)*w+x); }
+  for(var y=0;y<h;y++){ push(y*w); push(y*w+w-1); }
+  while(sp){
+    var p=stack[--sp], x=p%w, y=(p/w)|0;
+    if(x>0)   push(p-1);
+    if(x<w-1) push(p+1);
+    if(y>0)   push(p-w);
+    if(y<h-1) push(p+w);
+  }
+  var filled=0;
+  for(var i=0;i<n;i++) if(!bin[i] && !outside[i]){ a[i]=1; filled++; }
+  return filled;
+}
+// 统计：洞像素数
+function countHoles(bin, w, h){
+  var n=w*h, outside=new Uint8Array(n), stack=new Int32Array(n), sp=0;
+  function push(p){ if(!bin[p] && !outside[p]){ outside[p]=1; stack[sp++]=p; } }
+  for(var x=0;x<w;x++){ push(x); push((h-1)*w+x); }
+  for(var y=0;y<h;y++){ push(y*w); push(y*w+w-1); }
+  while(sp){
+    var p=stack[--sp], x=p%w, y=(p/w)|0;
+    if(x>0)   push(p-1);
+    if(x<w-1) push(p+1);
+    if(y>0)   push(p-w);
+    if(y<h-1) push(p+w);
+  }
+  var c=0;
+  for(var i=0;i<n;i++) if(!bin[i] && !outside[i]) c++;
+  return c;
+}
+// 统计：边缘绿超出度（5x5 邻域含透明的不透明像素），>25 即可见绿边
+function edgeSpill(rgba, a, w, h){
+  var bin=toBin(a), sum=0, cnt=0;
+  for(var y=0;y<h;y++)for(var x=0;x<w;x++){
+    var i=y*w+x;
+    if(!bin[i]) continue;
+    var all=true;
+    for(var dy=-2;dy<=2 && all;dy++){
+      var yy=y+dy; if(yy<0||yy>=h){ all=false; break; }
+      for(var dx=-2;dx<=2;dx++){
+        var xx=x+dx; if(xx<0||xx>=w||!bin[yy*w+xx]){ all=false; break; }
+      }
+    }
+    if(!all){
+      var j=i*4, G=rgba[j+1], mx=Math.max(rgba[j], rgba[j+2]);
+      sum+=G-mx; cnt++;
+    }
+  }
+  return cnt ? sum/cnt : 0;
+}
+function alphaArea(a){
+  var c=0;
+  for(var i=0;i<a.length;i++) if(a[i]>0.5) c++;
+  return c/a.length;
+}
+// 去重：变化像素占比（|lum差|>10 的比例 < 0.004 才算重复）
+function lumOf(data, w, h){
+  var n=w*h, L=new Uint8Array(n);
+  for(var i=0;i<n;i++){
+    var j=i*4;
+    L[i]=(data[j]*299 + data[j+1]*587 + data[j+2]*114)/1000;
+  }
+  return L;
+}
+function changedRatio(L1, L2){
+  if(L1.length!==L2.length) return 1;
+  var c=0, n=L1.length;
+  for(var i=0;i<n;i++) if(Math.abs(L1[i]-L2[i])>10) c++;
+  return c/n;
+}
+// 联合内容包围盒（alpha>0.5，pad 3 且夹到边界内）
+function unionBBox(frames){
+  var x0=1e9,y0=1e9,x1=-1,y1=-1;
+  for(var f=0; f<frames.length; f++){
+    var fr=frames[f], a=fr.a, w=fr.w, h=fr.h;
+    for(var y=0;y<h;y++)for(var x=0;x<w;x++){
+      if(a[y*w+x]>0.5){
+        if(x<x0)x0=x; if(x>x1)x1=x;
+        if(y<y0)y0=y; if(y>y1)y1=y;
+      }
+    }
+  }
+  if(x1<0) return null;
+  var pad=3, w=frames[0].w, h=frames[0].h;
+  return { x0:Math.max(0,x0-pad), y0:Math.max(0,y0-pad), x1:Math.min(w-1,x1+pad), y1:Math.min(h-1,y1+pad) };
+}
+// 裁剪子矩形（按行拷贝）。why: 全帧缓冲逐行连续存放，子矩形内容不连续，
+// 直接 slice 的长度不是 4*子宽度 的倍数 → ImageData 构造报错（真实踩过）。
+function cropRGBA(rgba, w, x0, y0, x1, y1){
+  var cw=x1-x0+1, ch=y1-y0+1;
+  var out=new Uint8ClampedArray(cw*ch*4);
+  for(var y=y0;y<=y1;y++){
+    var s=(y*w+x0)*4;
+    out.set(rgba.subarray(s, s+cw*4), (y-y0)*cw*4);
+  }
+  return out;
+}
+// 视频路径输出几何：full=原始帧；bbox=联合包围盒；custom=缩放居中到格
+function outGeometry(keyed, mode, cellW, cellH){
+  var w=keyed[0].w, h=keyed[0].h;
+  var bb=(mode!=='full') ? unionBBox(keyed) : null;
+  if(!bb) bb={x0:0,y0:0,x1:w-1,y1:h-1};
+  var sw=bb.x1-bb.x0+1, sh=bb.y1-bb.y0+1;
+  var cw, ch, scale=1;
+  if(mode==='custom' && cellW>0 && cellH>0){
+    cw=cellW; ch=cellH;
+    scale=Math.min(cw/sw, ch/sh);
+  } else { cw=sw; ch=sh; }
+  return { bb:bb, sw:sw, sh:sh, cw:cw, ch:ch, scale:scale };
+}
+// 文件夹图片模式输出几何（图片尺寸可能不一）：full=最大帧且 bb=null（整图居中）
+function imgGeometry(frames, mode, cellW, cellH){
+  var maxW=0, maxH=0;
+  for(var i=0;i<frames.length;i++){
+    if(frames[i].w>maxW) maxW=frames[i].w;
+    if(frames[i].h>maxH) maxH=frames[i].h;
+  }
+  var bb=(mode!=='full') ? unionBBox(frames) : null;
+  var sw, sh, scale=1, cw, ch;
+  if(mode==='full'){ cw=maxW; ch=maxH; }
+  else{
+    if(!bb) bb={x0:0,y0:0,x1:maxW-1,y1:maxH-1};
+    sw=bb.x1-bb.x0+1; sh=bb.y1-bb.y0+1;
+    if(mode==='custom' && cellW>0 && cellH>0){ cw=cellW; ch=cellH; scale=Math.min(cw/sw, ch/sh); }
+    else { cw=sw; ch=sh; }
+  }
+  return { bb:bb, sw:sw||maxW, sh:sh||maxH, cw:cw, ch:ch, scale:scale };
+}
+/*CORE-END*/
+
+// ==================== 应用层（DOM） ====================
+var $ = function(id){ return document.getElementById(id); };
+var logEl=$('log'), vid=$('vid'), cv=$('preview'), cx=cv.getContext('2d');
+// state 全局状态：
+//   file        当前视频 File 对象
+//   keyed/raws  处理后的帧（{rgba,a,w,h}）与原始帧（视频路径是 ImageData）
+//   stats       每帧质检指标 {spill 绿边, area 面积占比, holes 补洞数}
+//   strip       生成的条带 {canvas, n}
+//   geom        普通条带几何（outGeometry / imgGeometry 产出）
+//   sprites     多主体切块结果 [{frame, spr:{x0,y0,x1,y1,area}}]；非空时条带/ZIP 走切块路
+//   dirFiles    图片模式的 File 列表（自然序）
+//   base        输出文件名前缀（视频名/文件夹名）
+//   w,h         当前帧尺寸（renderPreview 布局依赖）
+var state={ file:null, keyed:[], raws:[], stats:[], strip:null, geom:null,
+            sprites:null, spriteGeom:null, dirFiles:null, base:'frames', w:0, h:0 };
+
+function log(msg, cls){
+  var d=document.createElement('div');
+  if(cls) d.className=cls;
+  d.textContent=msg;
+  logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight;
+}
+function raf(){ return new Promise(function(r){ requestAnimationFrame(r); }); }
+
+// ---- 入口路由：拖放区视频/图片通吃 ----
+var drop=$('drop'), fileIn=$('file');
+drop.onclick=function(){ fileIn.click(); };
+drop.ondragover=function(e){ e.preventDefault(); drop.classList.add('on'); };
+drop.ondragleave=function(){ drop.classList.remove('on'); };
+drop.ondrop=function(e){
+  e.preventDefault(); drop.classList.remove('on');
+  var fs=Array.prototype.slice.call(e.dataTransfer.files||[]);
+  var v=null;
+  for(var i=0;i<fs.length;i++) if(/^video\//.test(fs[i].type)){ v=fs[i]; break; }
+  if(v){ loadFile(v); return; }
+  acceptImages(fs, '拖入图片');
+  if(state.dirFiles && state.dirFiles.length)
+    log('[HINT] 图片已接管：需要去绿背景就勾选「对图片做绿幕抠像」，多主体图（表情表）勾选「多主体图」，然后点「合成条带」');
+};
+// 图片来源统一入口（文件夹选择 / 拖放 / 单选均可），数字自然序排序
+function acceptImages(fs, srcLabel){
+  fs=fs.filter(function(f){ return /^image\//.test(f.type); })
+       .sort(function(a,b){
+         return a.name.localeCompare(b.name, undefined, {numeric:true, sensitivity:'base'});
+       });
+  if(!fs.length){ log('[WARN] 没有图片文件','warn'); return; }
+  state.dirFiles=fs;
+  state.base=(((fs[0].webkitRelativePath||fs[0].name).split('/')[0]) || 'frames').replace(/\.[^.]+$/,'');
+  log('[OK] ' + srcLabel + '：' + fs.length + ' 张图片（' + state.base + '）','ok');
+  $('goDir').disabled=false;
+}
+var dropDir=$('dropDir'), dirIn=$('dirIn');
+dropDir.onclick=function(){ dirIn.click(); };
+dirIn.onchange=function(){ acceptImages(Array.prototype.slice.call(dirIn.files||[]), '文件夹'); };
+
+// ---- 模式页签：抠视频 / 抠图（共用抠像参数与导出） ----
+var DROP_HINT_V = '点击或拖入视频<br><span style="font-size:11px">mp4 / webm（HEVC 需浏览器支持该编码）</span>';
+var DROP_HINT_I = '点击或拖入图片（可多张）<br><span style="font-size:11px">透明 PNG 直接合成；绿底图勾选下方「对图片做绿幕抠像」</span>';
+function setMode(m){
+  var isV = (m === 'video');
+  $('secVideo').style.display = isV ? '' : 'none';
+  $('secImage').style.display = isV ? 'none' : '';
+  $('tabVid').className = isV ? 'on' : '';
+  $('tabImg').className = isV ? '' : 'on';
+  drop.innerHTML = isV ? DROP_HINT_V : DROP_HINT_I;
+  fileIn.accept  = isV ? 'video/*' : 'image/*';
+  if(isV) fileIn.removeAttribute('multiple');
+  else    fileIn.setAttribute('multiple','');
+}
+$('tabVid').onclick=function(){ setMode('video'); };
+$('tabImg').onclick=function(){ setMode('image'); };
+fileIn.onchange=function(){
+  var f=fileIn.files[0];
+  if(!f) return;
+  if(/^image\//.test(f.type)) acceptImages(Array.prototype.slice.call(fileIn.files), '选择图片');
+  else loadFile(f);
+};
+$('outMode').onchange=function(){ $('cellRow').style.display = $('outMode').value==='custom' ? '' : 'none'; };
+$('multiSub').onchange=function(){ $('minAreaRow').style.display = $('multiSub').checked ? '' : 'none'; };
+
+// ---- 视频载入（图片在任何入口都会被路由走，不会到这里） ----
+function loadFile(f){
+  if(/^image\//.test(f.type)){ acceptImages([f], '选择图片'); return; }
+  state.file=f;
+  state.base=(f.name||'frames').replace(/\.[^.]+$/,'').slice(0,60);
+  vid.src=URL.createObjectURL(f);
+  log('载入 ' + f.name + ' …');
+  vid.onloadedmetadata=function(){
+    state.w=vid.videoWidth; state.h=vid.videoHeight;
+    log('[OK] ' + state.w + 'x' + state.h + ' / ' + vid.duration.toFixed(2) + 's', 'ok');
+    $('go').disabled=false;
+  };
+  vid.onerror=function(){
+    log('[BAD] 视频解码失败——多半是 HEVC 编码，浏览器没有对应解码器。换 H.264 或用 Edge + HEVC 扩展。','bad');
+  };
+}
+
+// ---- 抽帧：按 1/fps 步长 seek 后 drawImage 到离屏 canvas 再 getImageData ----
+// why 逐帧 seek 而非 play() 逐 rAF 抓帧：AI 生成视频帧率不稳，seek 定位可复现且不会跳帧
+function seek(t){
+  return new Promise(function(res){
+    function done(){ vid.removeEventListener('seeked', done); res(); }
+    vid.addEventListener('seeked', done);
+    vid.currentTime=t;
+  });
+}
+async function extractFrames(fps, maxFrames){
+  var w=state.w, h=state.h;
+  var c=document.createElement('canvas'); c.width=w; c.height=h;
+  var g=c.getContext('2d',{willReadFrequently:true});
+  var frames=[], i=0, step=1/fps;
+  while(true){
+    var t=i*step;
+    if(t > vid.duration-0.01 || frames.length>=maxFrames) break;
+    await seek(t);
+    g.drawImage(vid,0,0);
+    frames.push(g.getImageData(0,0,w,h));
+    if(i%6===0){ log('  抽帧 ' + frames.length + ' (t=' + t.toFixed(2) + 's)'); await raf(); }
+    i++;
+  }
+  return frames;
+}
+
+// ---- 视频主流程：抽帧 → 去重 → 抠幕 → 质检，四步各自打日志 ----
+// 参数 P：lo/hi 键控阈值；absLo=0 表示关黑发门控，12/20 是实测的稳定档（见 chromaAlpha）
+$('go').onclick=run;
+async function run(){
+  $('go').disabled=true; $('dlStrip').disabled=true; $('dlZip').disabled=true;
+  logEl.innerHTML='';
+  try{
+    var fps=+$('fps').value, maxFrames=+$('maxFrames').value;
+    var P={ lo:+$('lo').value, hi:+$('hi').value, absLo:$('absGate').checked?12:0, absHi:20 };
+    var w=state.w, h=state.h;
+
+    log('== 1/4 抽帧 ==');
+    var raws=await extractFrames(fps, maxFrames);
+    log('[OK] 抽到 ' + raws.length + ' 帧','ok');
+
+    if($('dedupe').checked){
+      log('== 2/4 去重 ==');
+      var kept=[], prevLum=null;
+      for(var i=0;i<raws.length;i++){
+        var L=lumOf(raws[i].data,w,h);
+        if(prevLum===null || changedRatio(prevLum,L)>=0.004){ kept.push(raws[i]); prevLum=L; }
+      }
+      log('[OK] 去重后 ' + kept.length + ' 帧（丢 ' + (raws.length-kept.length) + '）','ok');
+      raws=kept;
+    } else log('== 2/4 去重：跳过 ==');
+
+    log('== 3/4 抠幕 ==');
+    state.keyed=[]; state.stats=[]; state.raws=raws; state.sprites=null; state.spriteGeom=null;
+    var scr=null;
+    for(var k=0;k<raws.length;k++){
+      var data=raws[k].data;
+      if(!scr){
+        scr=estimateScreen(data,w,h);
+        log('  幕布色估计 RGB(' + scr.map(Math.round).join(',') + ')');
+        var kexc=(scr[1]-Math.max(scr[0],scr[2]))/Math.max(scr[1],1);
+        if(kexc<0.15) log('  [WARN] 幕布绿度偏低（kexc=' + kexc.toFixed(2) + '），务必检查结果','warn');
+      }
+      var a=chromaAlpha(data,w,h,scr,P);
+      var fg=unpremultiply(data,w,h,scr,a);
+      erodeAlpha(a,w,h,1);
+      largestComponent(a,w,h);
+      var filled=$('fillHoles').checked ? fillHoles(a,w,h) : 0;
+      state.keyed.push({ rgba:fg, a:a, w:w, h:h });
+      state.stats.push({ spill:edgeSpill(fg,a,w,h), area:alphaArea(a), holes:filled });
+      if(k%8===0){ log('  抠像 ' + (k+1) + '/' + raws.length); await raf(); }
+    }
+
+    log('== 4/4 质检 ==');
+    renderStats();
+    renderPreview();
+    buildStrip();
+    log('[OK] 完成。可下载条带 / ZIP。','ok');
+  }catch(err){
+    log('[BAD] ' + (err && err.message || err),'bad');
+    console.error(err);
+  }
+  $('go').disabled=false;
+}
+
+// ---- 图片/文件夹主流程 ----
+// 与视频主流程的差异：① 图片尺寸可能不一（几何用 imgGeometry）；
+// ② 支持不抠像直通（透明 PNG 合成条带）；③ 支持多主体切块。
+function loadImage(url){
+  return new Promise(function(res,rej){
+    var im=new Image();
+    im.onload=function(){ res(im); };
+    im.onerror=function(){ rej(new Error('图片解码失败')); };
+    im.src=url;
+  });
+}
+$('goDir').onclick=runDir;
+async function runDir(){
+  $('goDir').disabled=true; $('dlStrip').disabled=true; $('dlZip').disabled=true;
+  logEl.innerHTML='';
+  try{
+    var doKey=$('dirKey').checked;
+    var multi=$('multiSub').checked;
+    var P={ lo:+$('lo').value, hi:+$('hi').value, absLo:$('absGate').checked?12:0, absHi:20 };
+    var minAreaRaw=+$('minArea').value||0;   // 0 = 自动（最大块×5%）
+    var frames=[], scr=null, totalComps=0;
+    for(var i=0;i<state.dirFiles.length;i++){
+      var url=URL.createObjectURL(state.dirFiles[i]);
+      var im=await loadImage(url);
+      var c=document.createElement('canvas'); c.width=im.naturalWidth; c.height=im.naturalHeight;
+      var g=c.getContext('2d',{willReadFrequently:true});
+      g.drawImage(im,0,0);
+      var img=g.getImageData(0,0,c.width,c.height);
+      URL.revokeObjectURL(url);
+      var a;
+      if(!doKey){
+        // 未勾抠像：透明 PNG 走 alpha；但如果整图几乎全不透明（JPEG 绿底忘了勾），必须提醒
+        var n0=c.width*c.height, opq=0;
+        for(var j=0;j<n0;j++) if(img.data[j*4+3]>250) opq++;
+        if(opq>n0*0.98) log('  [WARN] 图片几乎全不透明——绿底 JPEG 请勾选「对图片做绿幕抠像」，否则无法去背景','warn');
+        a=new Float32Array(n0);
+        for(var j=0;j<n0;j++) a[j]=img.data[j*4+3]/255;
+        frames.push({ rgba:new Uint8ClampedArray(img.data), a:a, w:c.width, h:c.height });
+      } else {
+        if(!scr){
+          scr=estimateScreen(img.data,c.width,c.height);
+          log('  幕布色估计 RGB(' + scr.map(Math.round).join(',') + ')');
+          var kexc=(scr[1]-Math.max(scr[0],scr[2]))/Math.max(scr[1],1);
+          if(kexc<0.15) log('  [WARN] 幕布绿度偏低（kexc=' + kexc.toFixed(2) + '），务必检查结果','warn');
+        }
+        a=chromaAlpha(img.data,c.width,c.height,scr,P);
+        var fg=unpremultiply(img.data,c.width,c.height,scr,a);
+        erodeAlpha(a,c.width,c.height,1);
+        var ma = minAreaRaw>0 ? minAreaRaw : autoMinArea(a,c.width,c.height);
+        if(multi){
+          totalComps+=keepComponents(a,c.width,c.height,ma);
+        } else {
+          // 单主体防呆：若 >=3 个面积>=主块25% 的块即将被 largestComponent 丢弃，
+          // 这必然是差分表而不是"碎屑"（真实踩坑：40 头只留 1 个，条带只剩一张脸）
+          var ars=componentAreas(a,c.width,c.height), mx=0, big=0;
+          for(var q=0;q<ars.length;q++) if(ars[q]>mx) mx=ars[q];
+          for(var q=0;q<ars.length;q++) if(ars[q]>=mx*0.25) big++;
+          if(big>=3){
+            log('  [WARN] 检测到 ' + big + ' 个大面积主体（表情差分表？）——已自动按多主体处理','warn');
+            multi=true;
+            totalComps+=keepComponents(a,c.width,c.height,ma);
+          } else largestComponent(a,c.width,c.height);
+        }
+        if($('fillHoles').checked) fillHoles(a,c.width,c.height);
+        frames.push({ rgba:fg, a:a, w:c.width, h:c.height });
+      }
+      if(i%8===0){ log('  处理 ' + (i+1) + '/' + state.dirFiles.length); await raf(); }
+    }
+    state.keyed=frames; state.raws=frames; state.stats=[];
+    if(frames.length){ state.w=frames[0].w; state.h=frames[0].h; }  // renderPreview 依赖
+    state.sprites=null; state.spriteGeom=null;
+    if(multi && doKey){
+      // 多主体：把所有帧的所有主体切块，按行优先（阅读顺序）排好
+      var items=[], rows=0;
+      frames.forEach(function(f){
+        var ma = minAreaRaw>0 ? minAreaRaw : autoMinArea(f.a, f.w, f.h);
+        var r=splitSprites(f.a, f.w, f.h, ma);
+        rows=Math.max(rows, r.rows);
+        r.sprites.forEach(function(s){ items.push({ frame:f, spr:s }); });
+      });
+      state.sprites=items;
+      log('[OK] 多主体：共 ' + items.length + ' 个主体（约 ' + rows + ' 行结构）','ok');
+      if(items.length && items.length<frames.length*2)
+        log('[WARN] 主体数偏少，检查「最小保留面积」是否太大','warn');
+    }
+    state.geom=imgGeometry(frames, $('outMode').value, +$('cellW').value, +$('cellH').value);
+    emitStrip(frames);
+    renderPreview();
+    log('[OK] 完成（' + frames.length + ' 帧，来源：' + state.base + '）','ok');
+  }catch(err){
+    log('[BAD] ' + (err && err.message || err),'bad');
+    console.error(err);
+  }
+  $('goDir').disabled=false;
+}
+
+// ---- 质检表 ----
+function renderStats(){
+  var S=state.stats, n=S.length;
+  if(!n) return;
+  var spills=S.map(function(s){return s.spill;}).sort(function(a,b){return a-b;});
+  var areas=S.map(function(s){return s.area;});
+  var holeFrames=[];
+  S.forEach(function(s,i){ if(s.holes>0) holeFrames.push(i+1); });
+  var p95=spills[Math.floor(spills.length*0.95)]||0;
+  var mean=spills.reduce(function(a,b){return a+b;},0)/n;
+  var bad=[];
+  S.forEach(function(s,i){ if(s.spill>25||s.area<0.05) bad.push(i+1); });
+  var rows=[
+    ['帧数', n],
+    ['边缘绿超出度', 'mean ' + mean.toFixed(1) + ' / p95 ' + p95.toFixed(1) + ' / worst ' + spills[spills.length-1].toFixed(1) + '　(>25 = 可见绿边)'],
+    ['alpha 面积占比', 'mean ' + (areas.reduce(function(a,b){return a+b;},0)/n).toFixed(3) + ' / min ' + Math.min.apply(null,areas).toFixed(3) + ' / max ' + Math.max.apply(null,areas).toFixed(3)],
+    ['内部洞', holeFrames.length ? ('出现于帧 ' + holeFrames.slice(0,8).join(',')) : '无'],
+    ['异常帧(绿边/抠崩)', bad.length ? bad.slice(0,10).join(',') : '无']
+  ];
+  var t=$('stats'); t.innerHTML='';
+  rows.forEach(function(r){
+    var tr=document.createElement('tr');
+    var td1=document.createElement('td'); td1.textContent=r[0];
+    var td2=document.createElement('td'); td2.textContent=r[1];
+    tr.appendChild(td1); tr.appendChild(td2); t.appendChild(tr);
+  });
+}
+
+// ---- 预览（兼容 ImageData 原帧 / {rgba,w,h} 两种来源） ----
+function toCanvas(fr){
+  var c=document.createElement('canvas');
+  if(fr instanceof ImageData){
+    c.width=fr.width; c.height=fr.height;
+    c.getContext('2d').putImageData(fr,0,0);
+  } else {
+    c.width=fr.w; c.height=fr.h;
+    c.getContext('2d').putImageData(new ImageData(fr.rgba,fr.w,fr.h),0,0);
+  }
+  return c;
+}
+function renderPreview(){
+  var keyed=state.keyed, raws=state.raws;
+  if(!keyed || !keyed.length) return;
+  var N=Math.min(keyed.length, 8);
+  var cols=Math.min(4, N), cellW=Math.floor(cv.width/cols);
+  var rows=2, cellH=Math.floor(cv.height/rows);
+  cx.fillStyle='#0d0f13'; cx.fillRect(0,0,cv.width,cv.height);
+  for(var i=0;i<N;i++){
+    var kc=toCanvas(keyed[i]);
+    var topFr=(raws && i<raws.length && (raws[i] instanceof ImageData)) ? raws[i] : null;
+    var oc=topFr ? toCanvas(topFr) : kc;
+    var sc=Math.min(cellW/oc.width, cellH/oc.height)*0.92;
+    var dw=oc.width*sc, dh=oc.height*sc;
+    var col=i%cols, row=(i/cols)|0;
+    var px=col*cellW+(cellW-dw)/2, pyTop=row*cellH+(cellH/2-dh)/2, pyBot=row*cellH+cellH/2+(cellH/2-dh)/2;
+    cx.drawImage(oc,px,pyTop,dw,dh);
+    var sq=12, forX=Math.ceil(dw/sq), forY=Math.ceil(dh/sq);
+    for(var yy=0;yy<forY;yy++)for(var xx=0;xx<forX;xx++){
+      cx.fillStyle=((xx+yy)&1)?'#1b2027':'#232a33';
+      cx.fillRect(px+xx*sq, pyBot+yy*sq, Math.min(sq,dw-xx*sq), Math.min(sq,dh-yy*sq));
+    }
+    cx.drawImage(kc,px,pyBot,dw,dh);
+  }
+  if(keyed.length>N) log('[NOTE] 预览只抽样前 ' + N + ' 帧，下载包含全部','warn');
+}
+
+// ---- 条带/ZIP：三种几何模式统一，视频与图片两路共用 ----
+function buildStrip(){
+  state.geom=outGeometry(state.keyed, $('outMode').value, +$('cellW').value, +$('cellH').value);
+  emitStrip(state.keyed);
+}
+function emitStrip(frames){
+  if(state.sprites && state.sprites.length){ emitSpriteStrip(); return; }
+  var G=state.geom;
+  var list=frames;
+  if(G.cw*list.length>16384){
+    var keep=Math.max(1, Math.floor(16384/G.cw));
+    var sel=[]; for(var i=0;i<keep;i++) sel.push(list[Math.floor(i*(list.length-1)/Math.max(1,keep-1))]);
+    log('[WARN] 条带过宽，已均匀抽样为 ' + keep + ' 帧','warn');
+    list=sel;
+  }
+  var c=document.createElement('canvas'); c.width=G.cw*list.length; c.height=G.ch;
+  var g=c.getContext('2d');
+  for(var k=0;k<list.length;k++) g.drawImage(renderCell(list[k],G), k*G.cw, 0);
+  state.strip={ canvas:c, n:list.length };
+  log('[OK] 输出统一尺寸 ' + G.cw + 'x' + G.ch + '：条带 ' + c.width + 'x' + c.height + '（' + list.length + ' 格），ZIP 每帧同尺寸','ok');
+  $('dlStrip').disabled=false; $('dlZip').disabled=false;
+}
+// 把一帧按几何渲染成统一尺寸的格画布。bb=null（图片"原始尺寸"模式）走整图居中。
+function renderCell(frame, G){
+  var c=document.createElement('canvas'); c.width=G.cw; c.height=G.ch;
+  var g=c.getContext('2d');
+  var tmp=toCanvas(frame);
+  g.imageSmoothingEnabled=G.scale<1;
+  if(g.imageSmoothingEnabled) g.imageSmoothingQuality='high';
+  if(G.bb){
+    var dw=G.sw*G.scale, dh=G.sh*G.scale;
+    g.drawImage(tmp, G.bb.x0,G.bb.y0,G.sw,G.sh, (G.cw-dw)/2,(G.ch-dh)/2,dw,dh);
+  } else {
+    var dw2=frame.w*G.scale, dh2=frame.h*G.scale;
+    g.drawImage(tmp, (G.cw-dw2)/2,(G.ch-dh2)/2, dw2,dh2);
+  }
+  return c;
+}
+// 多主体：每个主体独立成格，条带按阅读顺序横排
+function emitSpriteStrip(){
+  var items=state.sprites;
+  var maxW=0, maxH=0;
+  items.forEach(function(it){
+    var w=it.spr.x1-it.spr.x0+1, h=it.spr.y1-it.spr.y0+1;
+    if(w>maxW)maxW=w; if(h>maxH)maxH=h;
+  });
+  var cw=maxW, ch=maxH, scale=1;
+  if($('outMode').value==='custom'){
+    var cwi=+$('cellW').value, chi=+$('cellH').value;
+    if(cwi>0 && chi>0){ cw=cwi; ch=chi; scale=Math.min(cw/maxW, ch/maxH); }
+  }
+  var G={ bb:{x0:0,y0:0}, cw:cw, ch:ch, scale:scale };
+  state.spriteGeom=G;
+  var c=document.createElement('canvas'); c.width=cw*items.length; c.height=ch;
+  var g=c.getContext('2d');
+  items.forEach(function(it,k){ g.drawImage(renderSpriteCell(it,G), k*cw, 0); });
+  state.strip={ canvas:c, n:items.length };
+  log('[OK] 多主体条带：' + items.length + ' 格 × ' + cw + 'x' + ch + '（阅读顺序），ZIP 每格一张','ok');
+  $('dlStrip').disabled=false; $('dlZip').disabled=false;
+}
+function renderSpriteCell(item, G){
+  var f=item.frame, s=item.spr;
+  var sw=s.x1-s.x0+1, sh=s.y1-s.y0+1;
+  var c=document.createElement('canvas'); c.width=G.cw; c.height=G.ch;
+  var g=c.getContext('2d');
+  g.imageSmoothingEnabled=G.scale<1;
+  if(g.imageSmoothingEnabled) g.imageSmoothingQuality='high';
+  var tmp=toCanvas(f);
+  g.drawImage(tmp, s.x0,s.y0,sw,sh, (G.cw-sw*G.scale)/2,(G.ch-sh*G.scale)/2, sw*G.scale, sh*G.scale);
+  return c;
+}
+
+// ---- 下载 ----
+function dl(blob, name){
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=name; a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); }, 5000);
+}
+$('dlStrip').onclick=function(){
+  if(!state.strip) return;
+  state.strip.canvas.toBlob(function(b){ dl(b, state.base+'_strip.png'); }, 'image/png');
+};
+$('dlZip').onclick=async function(){
+  var btn=$('dlZip'); btn.disabled=true; log('打包 ZIP…');
+  try{
+    var entries=[];
+    if(state.sprites && state.sprites.length){
+      var G=state.spriteGeom;
+      for(var s=0;s<state.sprites.length;s++){
+        var c=renderSpriteCell(state.sprites[s],G);
+        var blob=await new Promise(function(r){ c.toBlob(r,'image/png'); });
+        entries.push({ name:(s+1)+'.png', u8:new Uint8Array(await blob.arrayBuffer()) });
+        if(s%10===0) await raf();
+      }
+    } else {
+      var G2=state.geom || outGeometry(state.keyed, $('outMode').value, +$('cellW').value, +$('cellH').value);
+      for(var i=0;i<state.keyed.length;i++){
+        var c2=renderCell(state.keyed[i],G2);
+        var blob2=await new Promise(function(r){ c2.toBlob(r,'image/png'); });
+        entries.push({ name:(i+1)+'.png', u8:new Uint8Array(await blob2.arrayBuffer()) });
+        if(i%10===0) await raf();
+      }
+    }
+    dl(makeZip(entries), state.base+'_keyed.zip');
+    log('[OK] ZIP 已生成（' + entries.length + ' 张，命名 1.png 起）','ok');
+  }catch(e){ log('[BAD] ' + e.message,'bad'); }
+  btn.disabled=false;
+};
+
+// ---- 极简 ZIP（store 不压缩，PNG 本身已压缩，无需 deflate） ----
+// 结构：[本地文件头+文件名+数据] * N + [中央目录] * N + EOCD。
+// 时间字段全 0（DOS epoch），解压软件均接受；CRC32 查表法一次算好。
+var CRC_TABLE=(function(){
+  var t=new Uint32Array(256);
+  for(var n=0;n<256;n++){ var c=n;
+    for(var k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);
+    t[n]=c>>>0; }
+  return t;
+})();
+function crc32(u8){
+  var c=0xFFFFFFFF;
+  for(var i=0;i<u8.length;i++) c=CRC_TABLE[(c^u8[i])&0xFF]^(c>>>8);
+  return (c^0xFFFFFFFF)>>>0;
+}
+function makeZip(entries){
+  var enc=new TextEncoder(), chunks=[], central=[], offset=0;
+  entries.forEach(function(e){
+    var name=enc.encode(e.name), data=e.u8, crc=crc32(data);
+    var lh=new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true);
+    lh.setUint32(14,crc,true); lh.setUint32(18,data.length,true); lh.setUint32(22,data.length,true);
+    lh.setUint16(26,name.length,true);
+    chunks.push(new Uint8Array(lh.buffer), name, data);
+    var ch=new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true);
+    ch.setUint32(16,crc,true); ch.setUint32(20,data.length,true); ch.setUint32(24,data.length,true);
+    ch.setUint16(28,name.length,true); ch.setUint32(42,offset,true);
+    central.push(new Uint8Array(ch.buffer), name);
+    offset+=30+name.length+data.length;
+  });
+  var cdStart=offset, cdSize=0;
+  central.forEach(function(c){ cdSize+=c.length; });
+  var eocd=new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0,0x06054b50,true);
+  eocd.setUint16(8,entries.length,true); eocd.setUint16(10,entries.length,true);
+  eocd.setUint32(12,cdSize,true); eocd.setUint32(16,cdStart,true);
+  return new Blob(chunks.concat(central,[new Uint8Array(eocd.buffer)]),{type:'application/zip'});
+}
+</script>
+</body>
+</html>
